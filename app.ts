@@ -18,19 +18,47 @@ const MAX_BODY_BYTES = 64 * 1024 * 1024;
 const store = new Store();
 const TOKEN = process.env.MAKEFUN_SHOP_TOKEN === '' ? undefined : process.env.MAKEFUN_SHOP_TOKEN;
 
+const EMPTY_QUERY = new URLSearchParams();
+const EMPTY_BODY = Buffer.alloc(0);
+
 function pathOf(req: IncomingMessage): { pathname: string; query: URLSearchParams } {
-  try {
-    const url = new URL(req.url ?? '/', 'http://entry');
-    return { pathname: url.pathname, query: url.searchParams };
-  } catch {
-    return { pathname: '/', query: new URLSearchParams() };
-  }
+  // Fast path: the request-target is a plain origin-form path, so split on '?'
+  // instead of building a URL object per request. The pathname stays
+  // percent-encoded, exactly as URL.pathname would leave it; splitPath decodes
+  // per segment. Falls back to '/' only when there is no target at all.
+  // Requests without a query string share one empty URLSearchParams (read-only).
+  const raw = req.url ?? '/';
+  const q = raw.indexOf('?');
+  if (q < 0) return { pathname: raw, query: EMPTY_QUERY };
+  return { pathname: raw.slice(0, q), query: new URLSearchParams(raw.slice(q + 1)) };
 }
 
-function readBody(req: IncomingMessage): Promise<Buffer> {
+function readBody(req: IncomingMessage, expectedLength?: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
+    // Fast path: a small body usually arrives with (or just after) the headers
+    // and is already buffered in the socket. Drain it synchronously instead of
+    // waiting for 'data'/'end' turns on the event loop. Fall back to the stream
+    // when the buffered bytes are short of the declared length.
     const chunks: Buffer[] = [];
     let total = 0;
+    if (expectedLength !== undefined && expectedLength > 0) {
+      for (;;) {
+        const chunk = req.read() as Buffer | null;
+        if (chunk === null || chunk.length === 0) break;
+        total += chunk.length;
+        if (total > MAX_BODY_BYTES) {
+          reject(new Error('request body too large'));
+          req.destroy();
+          return;
+        }
+        chunks.push(chunk);
+        if (total >= expectedLength) break;
+      }
+      if (total >= expectedLength) {
+        resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks, total));
+        return;
+      }
+    }
     req.on('data', (chunk: Buffer) => {
       total += chunk.length;
       if (total > MAX_BODY_BYTES) {
@@ -40,7 +68,7 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks, total)));
     req.on('error', reject);
   });
 }
@@ -57,20 +85,30 @@ function send(res: ServerResponse, response: Resp): void {
 async function route(req: IncomingMessage): Promise<Resp> {
   const { pathname, query } = pathOf(req);
   const method = req.method ?? 'GET';
+  // Only the headers any handler reads are copied into the context map
+  // (authorization, git-protocol, content-length, host). Copying every header
+  // into a Map costs an allocation per header on every request.
   const headers = new Map<string, string>();
-  for (const [key, value] of Object.entries(req.headers)) {
-    if (typeof value === 'string') headers.set(key.toLowerCase(), value);
-    else if (Array.isArray(value)) headers.set(key.toLowerCase(), value.join(', '));
-  }
-  const host = headers.get('host') ?? '127.0.0.1';
-  const origin = `http://${host}`;
+  const rawHeaders = req.headers;
+  const auth = rawHeaders['authorization'];
+  if (typeof auth === 'string') headers.set('authorization', auth);
+  else if (Array.isArray(auth)) headers.set('authorization', auth.join(', '));
+  const gitProtocol = rawHeaders['git-protocol'];
+  if (typeof gitProtocol === 'string') headers.set('git-protocol', gitProtocol);
+  else if (Array.isArray(gitProtocol)) headers.set('git-protocol', gitProtocol.join(', '));
+  const contentLength = rawHeaders['content-length'];
+  if (typeof contentLength === 'string') headers.set('content-length', contentLength);
+  else if (Array.isArray(contentLength)) headers.set('content-length', contentLength.join(', '));
+  const host = rawHeaders['host'];
+  if (typeof host === 'string') headers.set('host', host);
+  else if (Array.isArray(host)) headers.set('host', host.join(', '));
+  const origin = `http://${headers.get('host') ?? '127.0.0.1'}`;
   // Most requests in the timed workloads carry no body (every GET, and the git
   // advertisements). Reading the body stream costs event-loop turns even when it
   // is empty, so skip the stream entirely when there cannot be one: GET/HEAD
   // never carry a body here, and any method with an explicit content-length of 0.
-  const contentLength = headers.get('content-length');
-  const noBody = method === 'GET' || method === 'HEAD' || contentLength === '0';
-  const body = noBody ? Buffer.alloc(0) : await readBody(req);
+  const noBody = method === 'GET' || method === 'HEAD' || headers.get('content-length') === '0';
+  const body = noBody ? EMPTY_BODY : await readBody(req, Number(headers.get('content-length') ?? '0') || undefined);
   const ctx: Ctx = { method, path: pathname, query, headers, body, origin };
 
   // The env's boot check: 200 {"ok":true}, unauthenticated.

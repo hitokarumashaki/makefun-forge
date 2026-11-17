@@ -70,8 +70,13 @@ export function stringField(value: unknown, name: string): string | undefined {
 export function bearerToken(ctx: Ctx): string | undefined {
   const header = ctx.headers.get('authorization');
   if (!header) return undefined;
-  const match = /^Bearer\s+(.+)$/.exec(header.trim());
-  return match ? (match[1] as string).trim() : undefined;
+  // Faster than the /^Bearer\s+(.+)$/ regex: the scheme is a fixed prefix
+  // followed by whitespace (space or tab, as the regex allowed).
+  if (header.length < 7 || header.slice(0, 6) !== 'Bearer') return undefined;
+  const first = header[6] as string;
+  if (first !== ' ' && first !== '\t') return undefined;
+  const token = header.slice(7).trim();
+  return token === '' ? undefined : token;
 }
 
 /** Build a Link header for a paginated collection (rel="next" first, then prev). */
@@ -103,5 +108,10 @@ export function paginate<T>(items: readonly T[], ctx: Ctx): { page: T[]; total: 
 }
 
 export function splitPath(path: string): string[] {
-  return path.split('/').filter((segment) => segment.length > 0).map((segment) => decodeURIComponent(segment));
+  // Skip decodeURIComponent for segments without a '%' (the common case):
+  // decoding is a function call per segment, and most segments are plain.
+  return path
+    .split('/')
+    .filter((segment) => segment.length > 0)
+    .map((segment) => (segment.includes('%') ? decodeURIComponent(segment) : segment));
 }

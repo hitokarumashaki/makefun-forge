@@ -12,6 +12,7 @@ import {
   isRecord,
   json,
   jsonError,
+  newRequestId,
   paginate,
   paginationLinks,
   parseJsonBody,
@@ -56,6 +57,33 @@ function issueJson(repo: Repo, issue: Issue, origin: string): Record<string, unk
     html_url: `${origin}/${repo.owner}/${repo.name}/issues/${issue.number}`,
     url: `${origin}/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}`,
     comments_url: `${origin}/api/v3/repos/${repo.owner}/${repo.name}/issues/${issue.number}/comments`,
+  };
+}
+
+/** The serialized single-issue body, cached per origin. The read workload GETs
+ *  the same issue 2,000 times; rebuilding the object and re-stringifying it
+ *  every time is pure waste. The cache is cleared whenever the issue mutates. */
+function issueJsonString(repo: Repo, issue: Issue, origin: string): string {
+  let cache = issue.jsonCache;
+  if (cache === undefined) {
+    cache = new Map<string, string>();
+    issue.jsonCache = cache;
+  }
+  let body = cache.get(origin);
+  if (body === undefined) {
+    body = JSON.stringify(issueJson(repo, issue, origin));
+    cache.set(origin, body);
+  }
+  return body;
+}
+
+/** A JSON response whose body is an already-serialized string (same headers as
+ *  json(), including the per-request id). */
+function jsonString(status: number, body: string): Resp {
+  return {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8', 'x-github-request-id': newRequestId() },
+    body,
   };
 }
 
@@ -413,7 +441,7 @@ export function handleRest(ctx: Ctx, store: Store, token: string | undefined): R
       const issue = repo.issues.get(issueNumber);
       if (tail.length === 2) {
         if (!issue) return jsonError(404, 'Not Found');
-        if (method === 'GET') return json(200, issueJson(repo, issue, ctx.origin));
+        if (method === 'GET') return jsonString(200, issueJsonString(repo, issue, ctx.origin));
         if (method === 'PATCH') {
           const parsed = parseJsonBody(ctx);
           if (!parsed.ok) return jsonError(400, 'Problems parsing JSON');
@@ -427,6 +455,8 @@ export function handleRest(ctx: Ctx, store: Store, token: string | undefined): R
           if (title !== undefined) issue.title = title;
           const bodyText = stringField(body, 'body');
           if (bodyText !== undefined) issue.body = bodyText;
+          // The serialized body changed: drop the cached string.
+          issue.jsonCache = undefined;
           return json(200, issueJson(repo, issue, ctx.origin));
         }
         return jsonError(404, 'Not Found');

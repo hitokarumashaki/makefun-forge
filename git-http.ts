@@ -92,9 +92,33 @@ function sidebandTextLines(lines: readonly string[]): Buffer {
   return Buffer.concat([encodePktLine(Buffer.concat([Buffer.from([1]), payload])), FLUSH]);
 }
 
-interface RefLine {
-  oid: string;
-  name: string;
+/** ls-refs response cache. The refs of a repo change only when a ref moves, and
+ *  every ref mutation bumps repo.refVersion, so a cached response keyed on
+ *  (repo, refVersion, peel, symrefs, prefixes) is exact. A clone does one
+ *  ls-refs per clone; 50 concurrent clones of the same repo share one entry.
+ *  Bounded to 200 entries (FIFO eviction). */
+const LSREFS_CACHE = new Map<string, Buffer>();
+const LSREFS_CACHE_MAX = 200;
+
+function lsRefsCachePut(key: string, body: Buffer): void {
+  if (LSREFS_CACHE.size >= LSREFS_CACHE_MAX) {
+    const first = LSREFS_CACHE.keys().next();
+    if (!first.done) LSREFS_CACHE.delete(first.value);
+  }
+  LSREFS_CACHE.set(key, body);
+}
+
+/** v0 advertisement cache (upload-pack and receive-pack). Same invalidation:
+ *  the advertisement is a pure function of (repo, refVersion, service). */
+const V0_AD_CACHE = new Map<string, Buffer>();
+const V0_AD_CACHE_MAX = 200;
+
+function v0AdCachePut(key: string, body: Buffer): void {
+  if (V0_AD_CACHE.size >= V0_AD_CACHE_MAX) {
+    const first = V0_AD_CACHE.keys().next();
+    if (!first.done) V0_AD_CACHE.delete(first.value);
+  }
+  V0_AD_CACHE.set(key, body);
 }
 
 /** All refs of a repo, HEAD first, then sorted; annotated tags carry their peeled target. */
@@ -133,6 +157,9 @@ function peelToCommit(repo: Repo, oid: string): string | null {
 }
 
 function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const cacheKey = `${repo.id}|${repo.refVersion}|${service}`;
+  const cached = V0_AD_CACHE.get(cacheKey);
+  if (cached !== undefined) return cached;
   const capabilities =
     service === 'git-upload-pack'
       ? `side-band-64k shallow symref=HEAD:refs/heads/${repo.defaultBranch} agent=${AGENT}`
@@ -150,7 +177,9 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
     });
   }
   lines.push('flush');
-  return encodePktLines(lines);
+  const body = encodePktLines(lines);
+  v0AdCachePut(cacheKey, body);
+  return body;
 }
 
 function v2Advertisement(service: 'git-upload-pack'): Buffer {
@@ -391,6 +420,11 @@ function handleLsRefs(repo: Repo, body: Buffer): Resp {
     else if (trimmed === 'symrefs') symrefs = true;
     else if (trimmed.startsWith('ref-prefix ')) prefixes.push(trimmed.slice('ref-prefix '.length));
   }
+  const cacheKey = `${repo.id}|${repo.refVersion}|${peel ? 1 : 0}|${symrefs ? 1 : 0}|${prefixes.join(',')}`;
+  const cached = LSREFS_CACHE.get(cacheKey);
+  if (cached !== undefined) {
+    return { status: 200, headers: { 'content-type': UPLOAD_RESULT }, body: cached };
+  }
   const { lines: refs, peeled } = listRefs(repo);
   const out: string[] = [];
   for (const ref of refs) {
@@ -403,10 +437,12 @@ function handleLsRefs(repo: Repo, body: Buffer): Resp {
     }
     out.push(`${line}\n`);
   }
+  const responseBody = Buffer.concat([encodePktLines(out), FLUSH]);
+  lsRefsCachePut(cacheKey, responseBody);
   return {
     status: 200,
     headers: { 'content-type': UPLOAD_RESULT },
-    body: Buffer.concat([encodePktLines(out), FLUSH]),
+    body: responseBody,
   };
 }
 

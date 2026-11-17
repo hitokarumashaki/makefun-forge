@@ -36,6 +36,9 @@ export interface Issue {
   seq: number;
   createdAt: string;
   updatedAt: string;
+  /** Serialized JSON per origin (the body carries origin-derived URLs). Cleared
+   *  whenever the issue is mutated, so a cached string is always current. */
+  jsonCache?: Map<string, string>;
 }
 
 export interface Comment {
@@ -61,6 +64,25 @@ export interface PullRequest {
   createdAt: string;
 }
 
+/** A Map for refs that bumps the owning repo's refVersion on any mutation, so
+ *  caches keyed on ref state (ls-refs, advertisements) can invalidate cheaply. */
+class RefMap extends Map<string, string> {
+  private readonly repo: Repo;
+  constructor(repo: Repo) {
+    super();
+    this.repo = repo;
+  }
+  override set(key: string, value: string): this {
+    this.repo.refVersion += 1;
+    return super.set(key, value);
+  }
+  override delete(key: string): boolean {
+    const removed = super.delete(key);
+    if (removed) this.repo.refVersion += 1;
+    return removed;
+  }
+}
+
 export class Repo {
   readonly id: number;
   readonly owner: string;
@@ -69,7 +91,7 @@ export class Repo {
   description: string;
   readonly defaultBranch = 'main';
   readonly objects = new Map<string, GitObject>();
-  readonly refs = new Map<string, string>();
+  readonly refs: RefMap;
   readonly labels = new Map<string, Label>();
   readonly issues = new Map<number, Issue>();
   readonly pulls = new Map<number, PullRequest>();
@@ -77,6 +99,8 @@ export class Repo {
   nextIssueNumber = 1;
   nextPullNumber = 1;
   seq = 0;
+  /** Bumped on every refs mutation; caches keyed on ref state read this. */
+  refVersion = 0;
 
   constructor(id: number, owner: string, name: string, isPrivate: boolean, description: string) {
     this.id = id;
@@ -84,6 +108,7 @@ export class Repo {
     this.name = name;
     this.privateField = isPrivate;
     this.description = description;
+    this.refs = new RefMap(this);
   }
 
   get fullName(): string {
