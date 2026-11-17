@@ -46,8 +46,10 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 }
 
 function send(res: ServerResponse, response: Resp): void {
-  const body = response.body === undefined ? Buffer.alloc(0) : typeof response.body === 'string' ? Buffer.from(response.body, 'utf8') : response.body;
-  const headers: Record<string, string> = { 'content-length': String(body.length), ...(response.headers ?? {}) };
+  // Avoid allocating a Buffer for a string body: byteLength for the header, the string straight to end().
+  const body = response.body === undefined ? '' : response.body;
+  const length = typeof body === 'string' ? Buffer.byteLength(body, 'utf8') : body.length;
+  const headers: Record<string, string> = { 'content-length': String(length), ...(response.headers ?? {}) };
   res.writeHead(response.status, headers);
   res.end(body);
 }
@@ -62,7 +64,13 @@ async function route(req: IncomingMessage): Promise<Resp> {
   }
   const host = headers.get('host') ?? '127.0.0.1';
   const origin = `http://${host}`;
-  const body = await readBody(req);
+  // Most requests in the timed workloads carry no body (every GET, and the git
+  // advertisements). Reading the body stream costs event-loop turns even when it
+  // is empty, so skip the stream entirely when there cannot be one: GET/HEAD
+  // never carry a body here, and any method with an explicit content-length of 0.
+  const contentLength = headers.get('content-length');
+  const noBody = method === 'GET' || method === 'HEAD' || contentLength === '0';
+  const body = noBody ? Buffer.alloc(0) : await readBody(req);
   const ctx: Ctx = { method, path: pathname, query, headers, body, origin };
 
   // The env's boot check: 200 {"ok":true}, unauthenticated.

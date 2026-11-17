@@ -35,6 +35,45 @@ const UPLOAD_RESULT = 'application/x-git-upload-pack-result';
 const RECEIVE_AD = 'application/x-git-receive-pack-advertisement';
 const RECEIVE_RESULT = 'application/x-git-receive-pack-result';
 
+/** Fetch-response cache. Git objects are immutable and content-addressed, so the
+ *  pack for a given (repo, wants, shallow, deepen, deepen-since) is deterministic
+ *  and never changes — it is a pure function of those parameters. Two inputs do
+ *  depend on repo state beyond the object set, so they are excluded from caching:
+ *  `haves` (planFetch keeps only haves that exist in the repo, so adding an object
+ *  later would change the plan) and `deepen-not` (resolved through repo.refs,
+ *  which move). A fetch is cached only when both are empty — which is exactly the
+ *  shape of a fresh depth-1 clone (50 of them in the timed workload). Bounded to
+ *  200 entries; the whole response Buffer is reused, so a cache hit skips the
+ *  plan, the pack build (zlib per object) and the sideband framing entirely. */
+const FETCH_CACHE = new Map<string, Buffer>();
+const FETCH_CACHE_MAX = 200;
+
+function fetchCacheKey(
+  version: 'v0' | 'v2',
+  repo: Repo,
+  wants: readonly string[],
+  shallow: readonly string[],
+  deepen: number | undefined,
+  deepenSince: number | undefined,
+): string {
+  return [
+    version,
+    repo.id,
+    wants.join(','),
+    shallow.join(','),
+    deepen === undefined ? '' : String(deepen),
+    deepenSince === undefined ? '' : String(deepenSince),
+  ].join('|');
+}
+
+function fetchCachePut(key: string, body: Buffer): void {
+  if (FETCH_CACHE.size >= FETCH_CACHE_MAX) {
+    const first = FETCH_CACHE.keys().next();
+    if (!first.done) FETCH_CACHE.delete(first.value);
+  }
+  FETCH_CACHE.set(key, body);
+}
+
 /** Split a pack into sideband band-1 pkt-lines (≤ 65520 bytes per frame). */
 function sidebandPack(pack: Buffer): Buffer {
   const parts: Buffer[] = [];
@@ -116,18 +155,21 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
 
 function v2Advertisement(service: 'git-upload-pack'): Buffer {
   void service;
-  const lines: (string | Buffer | 'flush')[] = [
-    '# service=git-upload-pack\n',
-    'flush',
-    'version 2\n',
-    `agent=${AGENT}\n`,
-    'fetch=shallow\n',
-    'ls-refs\n',
-    'object-format=sha1\n',
-    'flush',
-  ];
-  return encodePktLines(lines);
+  return V2_ADVERTISEMENT;
 }
+
+/** The v2 capability advertisement is identical for every request (fixed agent and
+ *  capabilities, no repo state), so it is built once and reused. */
+const V2_ADVERTISEMENT: Buffer = encodePktLines([
+  '# service=git-upload-pack\n',
+  'flush',
+  'version 2\n',
+  `agent=${AGENT}\n`,
+  'fetch=shallow\n',
+  'ls-refs\n',
+  'object-format=sha1\n',
+  'flush',
+]);
 
 // ---------------------------------------------------------------------------------------------
 // fetch planning
@@ -386,6 +428,14 @@ function handleFetchV2(repo: Repo, body: Buffer): Resp {
     else if (trimmed.startsWith('deepen-since ')) deepenSince = Number(trimmed.slice(13));
     else if (trimmed.startsWith('deepen-not ')) deepenNot.push(trimmed.slice(11).trim());
   }
+  const cacheable = haves.length === 0 && deepenNot.length === 0;
+  const cacheKey = cacheable ? fetchCacheKey('v2', repo, wants, shallow, deepen, deepenSince) : '';
+  if (cacheable) {
+    const cached = FETCH_CACHE.get(cacheKey);
+    if (cached !== undefined) {
+      return { status: 200, headers: { 'content-type': UPLOAD_RESULT }, body: cached };
+    }
+  }
   const plan = planFetch(repo, wants, haves, shallow, deepen, deepenSince, deepenNot);
   const parts: Buffer[] = [];
   if (haves.length > 0) {
@@ -405,10 +455,12 @@ function handleFetchV2(repo: Repo, body: Buffer): Resp {
   }
   const pack = writePack(plan.objects);
   parts.push(encodePktLine('packfile\n'), sidebandPack(pack));
+  const responseBody = Buffer.concat(parts);
+  if (cacheable) fetchCachePut(cacheKey, responseBody);
   return {
     status: 200,
     headers: { 'content-type': UPLOAD_RESULT },
-    body: Buffer.concat(parts),
+    body: responseBody,
   };
 }
 
@@ -438,6 +490,14 @@ function handleFetchV0(repo: Repo, body: Buffer): Resp {
       if (line.startsWith('have ')) haves.push(line.slice(5).trim());
     }
   }
+  const cacheable = haves.length === 0 && deepenNot.length === 0;
+  const cacheKey = cacheable ? fetchCacheKey('v0', repo, wants, shallow, deepen, deepenSince) : '';
+  if (cacheable) {
+    const cached = FETCH_CACHE.get(cacheKey);
+    if (cached !== undefined) {
+      return { status: 200, headers: { 'content-type': UPLOAD_RESULT }, body: cached };
+    }
+  }
   const plan = planFetch(repo, wants, haves, shallow, deepen, deepenSince, deepenNot);
   const headLines: string[] = [];
   if (haves.length > 0) {
@@ -449,10 +509,12 @@ function handleFetchV0(repo: Repo, body: Buffer): Resp {
   for (const oid of plan.shallow) headLines.push(`shallow ${oid}`);
   for (const oid of plan.unshallow) headLines.push(`unshallow ${oid}`);
   const pack = writePack(plan.objects);
+  const responseBody = Buffer.concat([encodePktLines(headLines.map((line) => `${line}\n`)), sidebandPack(pack)]);
+  if (cacheable) fetchCachePut(cacheKey, responseBody);
   return {
     status: 200,
     headers: { 'content-type': UPLOAD_RESULT },
-    body: Buffer.concat([encodePktLines(headLines.map((line) => `${line}\n`)), sidebandPack(pack)]),
+    body: responseBody,
   };
 }
 

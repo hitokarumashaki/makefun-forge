@@ -1,8 +1,6 @@
 // Shared HTTP plumbing for the four surfaces: request context, JSON responses with
 // the request-id header every REST reply must carry, and JSON body parsing.
 
-import { randomBytes } from 'node:crypto';
-
 export interface Ctx {
   method: string;
   /** Decoded pathname (percent-decoding applied per segment by the router). */
@@ -20,8 +18,13 @@ export interface Resp {
   body?: string | Buffer;
 }
 
+/** A per-request id: a counter, hex-encoded. The contract only needs a non-empty
+ *  X-GitHub-Request-Id; a counter is unique per request, deterministic (good for
+ *  replay determinism) and far cheaper than a crypto random draw per response. */
+let requestCounter = 0;
 export function newRequestId(): string {
-  return randomBytes(16).toString('hex');
+  requestCounter = (requestCounter + 1) >>> 0;
+  return requestCounter.toString(16).padStart(8, '0');
 }
 
 export function json(status: number, data: unknown, extraHeaders: Record<string, string> = {}): Resp {
